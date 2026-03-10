@@ -37,6 +37,14 @@ type AgentInstance struct {
 	Subagents                 *config.SubagentsConfig
 	SkillsFilter              []string
 	Candidates                []providers.FallbackCandidate
+
+	// Router is non-nil when model routing is configured and the light model
+	// was successfully resolved. It scores each incoming message and decides
+	// whether to route to LightCandidates or stay with Candidates.
+	Router *routing.Router
+	// LightCandidates holds the resolved provider candidates for the light model.
+	// Pre-computed at agent creation to avoid repeated model_list lookups at runtime.
+	LightCandidates []providers.FallbackCandidate
 }
 
 // NewAgentInstance creates an agent instance from config.
@@ -62,7 +70,8 @@ func NewAgentInstance(
 	toolsRegistry := tools.NewToolRegistry()
 
 	if cfg.Tools.IsToolEnabled("read_file") {
-		toolsRegistry.Register(tools.NewReadFileTool(workspace, readRestrict, allowReadPaths))
+		maxReadFileSize := cfg.Tools.ReadFile.MaxReadFileSize
+		toolsRegistry.Register(tools.NewReadFileTool(workspace, readRestrict, maxReadFileSize, allowReadPaths))
 	}
 	if cfg.Tools.IsToolEnabled("write_file") {
 		toolsRegistry.Register(tools.NewWriteFileTool(workspace, restrict, allowWritePaths))
@@ -180,6 +189,25 @@ func NewAgentInstance(
 
 	candidates := providers.ResolveCandidatesWithLookup(modelCfg, defaults.Provider, resolveFromModelList)
 
+	// Model routing setup: pre-resolve light model candidates at creation time
+	// to avoid repeated model_list lookups on every incoming message.
+	var router *routing.Router
+	var lightCandidates []providers.FallbackCandidate
+	if rc := defaults.Routing; rc != nil && rc.Enabled && rc.LightModel != "" {
+		lightModelCfg := providers.ModelConfig{Primary: rc.LightModel}
+		resolved := providers.ResolveCandidatesWithLookup(lightModelCfg, defaults.Provider, resolveFromModelList)
+		if len(resolved) > 0 {
+			router = routing.New(routing.RouterConfig{
+				LightModel: rc.LightModel,
+				Threshold:  rc.Threshold,
+			})
+			lightCandidates = resolved
+		} else {
+			log.Printf("routing: light_model %q not found in model_list — routing disabled for agent %q",
+				rc.LightModel, agentID)
+		}
+	}
+
 	return &AgentInstance{
 		ID:                        agentID,
 		Name:                      agentName,
@@ -200,6 +228,8 @@ func NewAgentInstance(
 		Subagents:                 subagents,
 		SkillsFilter:              skillsFilter,
 		Candidates:                candidates,
+		Router:                    router,
+		LightCandidates:           lightCandidates,
 	}
 }
 
